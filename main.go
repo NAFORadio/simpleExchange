@@ -11,8 +11,10 @@ import (
     "log"
     "net"
     "os"
+    "path/filepath"
     "sync"
     "time"
+    "container/list"
 )
 
 const (
@@ -48,6 +50,12 @@ type Statistics struct {
     mutex         sync.RWMutex
 }
 
+type QueuedMessage struct {
+    Message   Message
+    Attempts  int
+    LastTry   time.Time
+}
+
 type Messenger struct {
     ID            string
     peers         map[string]*Peer
@@ -55,6 +63,9 @@ type Messenger struct {
     encryptionKey []byte
     stats         Statistics
     running       bool
+    shutdown      chan struct{}
+    messageQueue  *list.List
+    queueMutex   sync.RWMutex
 }
 
 func NewMessenger() *Messenger {
@@ -66,11 +77,20 @@ func NewMessenger() *Messenger {
     key := make([]byte, 32)
     rand.Read(key)
     
-    return &Messenger{
+    m := &Messenger{
         ID:            fmt.Sprintf("%x", id),
         peers:         make(map[string]*Peer),
         encryptionKey: key,
+        shutdown:      make(chan struct{}),
+        running:       true,
+        messageQueue:  list.New(),
     }
+    m.stats.StartTime = time.Now()
+    
+    // Start queue processor
+    go m.processMessageQueue()
+    
+    return m
 }
 
 func (m *Messenger) startDiscovery() {
@@ -263,6 +283,181 @@ func formatBytes(bytes int64) string {
         exp++
     }
     return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+func (m *Messenger) Cleanup() {
+    close(m.shutdown)
+    m.running = false
+    
+    // Clean up peers
+    m.peersMutex.Lock()
+    for id, peer := range m.peers {
+        peer.Connected = false
+        delete(m.peers, id)
+    }
+    m.peersMutex.Unlock()
+}
+
+func (m *Messenger) startMessageListener() {
+    addr := &net.UDPAddr{Port: messagePort}
+    conn, err := net.ListenUDP("udp", addr)
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer conn.Close()
+
+    // Create error channel for goroutine
+    errChan := make(chan error, 1)
+    
+    // Start listener in goroutine
+    go func() {
+        buffer := make([]byte, maxFileSize)
+        for {
+            select {
+            case <-m.shutdown:
+                return
+            default:
+                conn.SetReadDeadline(time.Now().Add(time.Second))
+                n, _, err := conn.ReadFromUDP(buffer)
+                if err != nil {
+                    if !os.IsTimeout(err) {
+                        errChan <- err
+                    }
+                    continue
+                }
+
+                // Process message
+                if err := m.handleMessage(buffer[:n]); err != nil {
+                    log.Printf("Error handling message: %v", err)
+                }
+            }
+        }
+    }()
+
+    // Monitor for errors
+    select {
+    case err := <-errChan:
+        log.Printf("Message listener error: %v", err)
+    case <-m.shutdown:
+        return
+    }
+}
+
+func (m *Messenger) handleMessage(data []byte) error {
+    // Decrypt and handle message
+    decrypted, err := m.decrypt(data)
+    if err != nil {
+        return fmt.Errorf("failed to decrypt: %v", err)
+    }
+
+    var msg Message
+    if err := json.Unmarshal(decrypted, &msg); err != nil {
+        return fmt.Errorf("failed to unmarshal: %v", err)
+    }
+
+    // Update statistics
+    m.updateStats(msg, false)
+
+    // Handle based on message type
+    switch msg.Type {
+    case "text":
+        fmt.Printf("\n%sReceived from %s: %s%s\nEnter command: ", 
+            clearLine, msg.SenderID, msg.Content, moveToStart)
+    
+    case "file":
+        // Create received files directory if it doesn't exist
+        if err := os.MkdirAll("received_files", 0755); err != nil {
+            return fmt.Errorf("failed to create received_files directory: %v", err)
+        }
+
+        // Save file with unique name
+        filename := filepath.Base(msg.Content)
+        savePath := filepath.Join("received_files", 
+            fmt.Sprintf("%s_%s", msg.SenderID, filename))
+        
+        if err := os.WriteFile(savePath, msg.Data, 0644); err != nil {
+            return fmt.Errorf("failed to save file: %v", err)
+        }
+
+        fmt.Printf("\n%sReceived file from %s: %s%s\nEnter command: ",
+            clearLine, msg.SenderID, savePath, moveToStart)
+    }
+
+    return nil
+}
+
+func (m *Messenger) processMessageQueue() {
+    ticker := time.NewTicker(5 * time.Second)
+    defer ticker.Stop()
+
+    for {
+        select {
+        case <-m.shutdown:
+            return
+        case <-ticker.C:
+            m.retryQueuedMessages()
+        }
+    }
+}
+
+func (m *Messenger) retryQueuedMessages() {
+    m.queueMutex.Lock()
+    defer m.queueMutex.Unlock()
+
+    for e := m.messageQueue.Front(); e != nil; {
+        qm := e.Value.(*QueuedMessage)
+        next := e.Next() // Store next before potential removal
+
+        // Skip if not enough time has passed since last attempt
+        if time.Since(qm.LastTry) < time.Second*5 {
+            e = next
+            continue
+        }
+
+        // Try to send the message
+        sent := false
+        m.peersMutex.RLock()
+        for _, peer := range m.peers {
+            if peer.ID != m.ID && time.Since(peer.LastSeen) < time.Second*10 {
+                if err := m.sendToPeer(peer, qm.Message); err == nil {
+                    sent = true
+                }
+            }
+        }
+        m.peersMutex.RUnlock()
+
+        if sent {
+            // Message sent successfully, remove from queue
+            m.messageQueue.Remove(e)
+            log.Printf("Successfully sent queued %s after %d attempts\n", 
+                qm.Message.Type, qm.Attempts)
+        } else {
+            // Update attempt count and last try time
+            qm.Attempts++
+            qm.LastTry = time.Now()
+            
+            // Remove if too many attempts
+            if qm.Attempts > 12 { // 1 minute of retries
+                m.messageQueue.Remove(e)
+                log.Printf("Dropping %s message after %d failed attempts\n", 
+                    qm.Message.Type, qm.Attempts)
+            }
+        }
+
+        e = next
+    }
+}
+
+func (m *Messenger) queueMessage(msg Message) {
+    m.queueMutex.Lock()
+    defer m.queueMutex.Unlock()
+
+    qm := &QueuedMessage{
+        Message:  msg,
+        Attempts: 0,
+        LastTry:  time.Now(),
+    }
+    m.messageQueue.PushBack(qm)
 }
 
 func main() {

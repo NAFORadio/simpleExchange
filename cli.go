@@ -4,7 +4,6 @@ import (
     "bufio"
     "encoding/json"
     "fmt"
-    "log"
     "net"
     "os"
     "strings"
@@ -40,6 +39,30 @@ func showSplashScreen() {
     fmt.Println(splash)
 }
 
+func validateCommand(input string) error {
+    if input == "" {
+        return fmt.Errorf("empty command")
+    }
+
+    if strings.HasPrefix(input, "send ") {
+        if len(input) <= 5 {
+            return fmt.Errorf("empty message")
+        }
+    }
+
+    if strings.HasPrefix(input, "file ") {
+        if len(input) <= 5 {
+            return fmt.Errorf("no file path provided")
+        }
+        filepath := input[5:]
+        if _, err := os.Stat(filepath); os.IsNotExist(err) {
+            return fmt.Errorf("file does not exist: %s", filepath)
+        }
+    }
+
+    return nil
+}
+
 func startCLI(messenger *Messenger) {
     showSplashScreen()
     fmt.Printf("Your ID: %s\n\n", messenger.ID)
@@ -71,6 +94,13 @@ func startCLI(messenger *Messenger) {
     for scanner.Scan() {
         input := scanner.Text()
         
+        // Validate input
+        if err := validateCommand(input); err != nil {
+            fmt.Printf("Error: %v\n", err)
+            fmt.Print("\nEnter command: ")
+            continue
+        }
+
         // Clear the input line after command
         fmt.Print(clearLine + moveToStart)
         
@@ -148,6 +178,14 @@ func handleSendCommand(messenger *Messenger, message string) {
     }
     messenger.peersMutex.RUnlock()
 
+    if peerCount == 0 {
+        // No peers available, queue the message
+        messenger.queueMessage(msg)
+        fmt.Printf("\n%sNo peers available. Message queued for retry%s\n\nEnter command: ",
+            clearLine, moveToStart)
+        return
+    }
+
     // Update statistics
     messenger.updateStats(msg, true)
 
@@ -182,17 +220,30 @@ func handleFileCommand(messenger *Messenger, filepath string) {
 
     // Broadcast to all peers except self
     messenger.peersMutex.RLock()
+    peerCount := 0
     for _, peer := range messenger.peers {
         if peer.ID != messenger.ID {
-            // Implementation for sending to specific peer
-            // This would use the peer's Address to send the message
             fmt.Printf("Sending file to peer %s...\n", peer.ID)
+            if err := messenger.sendToPeer(peer, msg); err != nil {
+                fmt.Printf("Error sending to %s: %v\n", peer.ID, err)
+                continue
+            }
+            peerCount++
         }
     }
     messenger.peersMutex.RUnlock()
 
+    if peerCount == 0 {
+        // No peers available, queue the message
+        messenger.queueMessage(msg)
+        fmt.Printf("\n%sNo peers available. File queued for retry%s\n\nEnter command: ",
+            clearLine, moveToStart)
+        return
+    }
+
     messenger.updateStats(msg, true)
-    fmt.Printf("File %s broadcast complete\n", filepath)
+    fmt.Printf("\n%sFile sent to %d peers%s\n\nEnter command: ", 
+        clearLine, peerCount, moveToStart)
 }
 
 func handleStatusCommand(messenger *Messenger) {
@@ -244,39 +295,4 @@ func (m *Messenger) sendToPeer(peer *Peer, msg Message) error {
     }
 
     return nil
-}
-
-func (m *Messenger) startMessageListener() {
-    addr := &net.UDPAddr{Port: messagePort}
-    conn, err := net.ListenUDP("udp", addr)
-    if err != nil {
-        log.Fatal(err)
-    }
-    defer conn.Close()
-
-    buffer := make([]byte, maxFileSize)
-    for {
-        n, _, err := conn.ReadFromUDP(buffer)
-        if err != nil {
-            continue
-        }
-
-        // Decrypt and handle message
-        decrypted, err := m.decrypt(buffer[:n])
-        if err != nil {
-            continue
-        }
-
-        var msg Message
-        if err := json.Unmarshal(decrypted, &msg); err != nil {
-            continue
-        }
-
-        // Update statistics
-        m.updateStats(msg, false)
-
-        // Display message
-        fmt.Printf("\n%sReceived from %s: %s%s\nEnter command: ", 
-            clearLine, msg.SenderID, msg.Content, moveToStart)
-    }
 } 
